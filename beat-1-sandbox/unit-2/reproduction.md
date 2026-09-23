@@ -25,11 +25,11 @@ https://github.com/codepath/pathreview-ai301-fa26-s1/issues/14#issuecomment-5804
 Posted 2026-09-23. Text as posted:
 
 `````
-I'd like to take this one. I've confirmed the current state at f89c06f before claiming: `make eval` runs `scripts/run_evals.py`, prints "Evaluation complete. Results written to eval_results.json", exits 0, and writes no file, so the success line is not true. Reading `.github/workflows/eval.yml`, the RAG Evaluation step falls back to its `results = 'Eval results not found.'` default inside an empty `catch`, so on that reading the gap never surfaces as a failure — though I have only read the workflow, not watched a run of it. `EvalSuite` itself works when called directly; `grep -rn "EvalSuite" --include="*.py" .` returns only its own class definition, so the parts exist and nothing is wired to them. Full reproduction in a follow-up comment.
+I'd like to take this one. Before claiming I checked the current state at f89c06f: `make eval` prints "Evaluation complete. Results written to eval_results.json", exits 0, and writes no file. A grep for `EvalSuite` returns only its own class definition, so the scorer works but nothing calls it. Full reproduction in the comment below.
 
-Two things I'd like a steer on before I write much code. First, scoring: `EvalSuite.run` returns relevance and faithfulness, but the TODO in `run_evals.py` also asks for actionability, and there is no actionability scorer in `rag/evaluator/`. Is adding one in scope here, or should the first cut report the two scorers that already exist? Second, the mock path: `ReviewGenerator.__init__` constructs its own `openai.OpenAI` client, so "run each through the full RAG pipeline with mock LLM" needs an injection seam that does not exist yet — I'd rather agree on where that seam goes than invent one and have it sent back.
+Two questions before I write much code. First, does an actionability scorer belong in this issue? `EvalSuite.run` returns relevance and faithfulness, and `rag/evaluator/` has no actionability scorer to call, though the TODO asks for one. Second, where should the mock seam go? `ReviewGenerator.__init__` builds its own `openai.OpenAI` client, so running the pipeline with a mock LLM needs an injection point that does not exist yet. I would rather settle that with a maintainer than guess and have it sent back.
 
-My next step is the fixture loader plus scoring over `basic_profile.json`, and a branch with the `eval_results.json` it produces; I'll say then what the remaining slices look like. If someone else is already mid-flight on this, say so and I'll take a narrower piece.
+Next I will write the fixture loader, score `basic_profile.json` with it, and push a branch with the `eval_results.json` it produces. I will describe the remaining slices then. If someone is already working on this, say so and I will take a narrower piece.
 `````
 
 **Reproduction comment**
@@ -39,16 +39,13 @@ https://github.com/codepath/pathreview-ai301-fa26-s1/issues/14#issuecomment-5804
 Posted 2026-09-23. Text as posted:
 
 `````
-Environment: macOS 15.7.7 (arm64), Python 3.11.9, pathreview 0.1.0 installed with `pip install -e ".[dev]"`, structlog 26.1.0, pytest 9.1.1, repo at commit f89c06fc3ff292df2a04a39ac51319d32a76b779 on main. `.env` is an unmodified copy of `.env.example`, so `LLM_PROVIDER=mock`. No Docker services were started and none are needed: `make eval` is just `.venv/bin/python scripts/run_evals.py`, and nothing below touches Postgres, Redis or Chroma. The project pins 3.11 in `pyproject.toml`, in the four Python jobs in `ci.yml` and in the eval workflow, so this is the version CI runs on.
+Environment: macOS 15.7.7 (arm64), Python 3.11.9, pathreview 0.1.0 installed with `pip install -e ".[dev]"`, repo at commit f89c06fc3ff292df2a04a39ac51319d32a76b779 on main. I copied `.env` from `.env.example` without edits, so `LLM_PROVIDER=mock`. I started no Docker services and none are needed here, since `make eval` only runs `.venv/bin/python scripts/run_evals.py`. The project pins 3.11 in `pyproject.toml` and in every Python job in CI.
 
-Steps: cloned at that commit, created a venv on Python 3.11, `pip install -e ".[dev]"`, `cp .env.example .env` with no edits. Then three independent probes — `make eval` with a before-and-after check for the file it says it wrote, a grep for callers of `EvalSuite` plus a direct call to it, and a read of the workflow that consumes the output.
+Steps: clone at that commit, create a venv on Python 3.11, run `pip install -e ".[dev]"`, copy `.env.example` to `.env`, then run `make eval`.
 
-The runner claims success and writes nothing:
+The runner reports success and writes nothing:
 
 ```
-$ git rev-parse HEAD
-f89c06fc3ff292df2a04a39ac51319d32a76b779
-
 $ test -f eval_results.json; echo $?
 1
 
@@ -63,57 +60,15 @@ $ test -f eval_results.json; echo $?
 1
 ```
 
-The second printed line is false, and the exit status is 0, which is what lets it pass unnoticed.
+The second line it prints is false, and it still exits 0.
 
-`EvalSuite` is defined and never called. The grep returns one hit, its own class statement, and `rag/evaluator/__init__.py` is zero bytes so it is not re-exported either:
+The scorer is unwired rather than broken. `grep -rn "EvalSuite" --include="*.py" .` returns a single hit, `rag/evaluator/eval_suite.py:22:class EvalSuite:`, and `rag/evaluator/__init__.py` is zero bytes, so nothing re-exports it either. Calling it directly works: `EvalSuite().run("python fastapi", [{"text": "python expert building fastapi services"}], "This developer knows Python and FastAPI.")` returns `EvalResult(relevance_score=1.0, faithfulness_score=1.0, overall_score=1.0)`. On the input side, `tests/fixtures/sample_profiles/basic_profile.json` parses and holds two repos, so the fixture problem from #43 does not block this.
 
-```
-$ grep -rn "EvalSuite" --include="*.py" .
-rag/evaluator/eval_suite.py:22:class EvalSuite:
+`.github/workflows/eval.yml` sets `let results = 'Eval results not found.'` and overwrites it only inside a `try` with an empty `catch`, so a missing file yields that literal text rather than a failure. I read that from the workflow file and have not watched a run of it.
 
-$ wc -c rag/evaluator/__init__.py
-       0 rag/evaluator/__init__.py
-```
+This matches the issue: the script prints two lines and returns, no code calls `EvalSuite`, and `eval_results.json` never appears for the workflow to read. Reproduced.
 
-It is not broken, only unwired — calling it directly scores a query and feedback with no extra plumbing:
-
-```
-$ .venv/bin/python -c 'from rag.evaluator.eval_suite import EvalSuite
-r = EvalSuite().run("python fastapi", [{"text": "python expert building fastapi services"}], "This developer knows Python and FastAPI.")
-print(r)'
-2026-09-24 04:12:23 [info     ] relevance_scored               avg_score=1.0 chunks_count=1 query_len=2
-2026-09-24 04:12:23 [info     ] faithfulness_checked           claims_count=1 score=1.0 supported_count=1
-2026-09-24 04:12:23 [info     ] eval_suite_complete            faithfulness=1.0 overall=1.0 relevance=1.0
-EvalResult(relevance_score=1.0, faithfulness_score=1.0, overall_score=1.0)
-```
-
-The workflow that consumes the output tolerates the missing file. `.github/workflows/eval.yml` seeds a default string and overwrites it only if the file reads, inside a `try` with an empty `catch`:
-
-```
-$ sed -n '29,33p' .github/workflows/eval.yml
-            const fs = require('fs');
-            let results = 'Eval results not found.';
-            try {
-              results = fs.readFileSync('eval_results.json', 'utf8');
-            } catch (e) {}
-```
-
-Reading those lines, the missing file is swallowed and the step reports the literal text "Eval results not found." rather than failing. That is from the workflow file; I have not watched a CI run of it, and the workflow only fires on pull requests touching `rag/**`, `ingestion/chunking/**` or `ingestion/embeddings/**`.
-
-As a control on the input side, the fixture the runner is meant to load is present and parses, so none of this is blocked on the missing-fixture problem from #43:
-
-```
-$ .venv/bin/python -c 'import json
-d = json.load(open("tests/fixtures/sample_profiles/basic_profile.json"))
-print("valid JSON; keys:", sorted(d))
-print("repos:", [r["name"] for r in d["repos"]])'
-valid JSON; keys: ['github_username', 'portfolio_url', 'repos', 'resume_filename']
-repos: ['transit-delay-tracker', 'recipe-scaler']
-```
-
-Behavior observed matches the issue: `run_evals.py` prints two lines and returns, no code calls `EvalSuite`, and `eval_results.json` is never produced for the RAG Evaluation workflow to read. Reproduced, not a cannot-reproduce case.
-
-Three things I hit that the issue body does not mention, and that I think shape the work. The TODO in `run_evals.py` asks for relevance, faithfulness and actionability, but `rag/evaluator/` holds only `relevance_scorer.py` and `faithfulness_checker.py` — there is no actionability scorer to call. `ReviewGenerator.__init__` builds its own `openai.OpenAI` client with no dispatch on `settings.llm_provider`, so "the full RAG pipeline with mock LLM" has no seam to inject a stub through, even though the workflow runs the step with `LLM_PROVIDER: mock`. And `basic_profile.json` is a single profile where the issue asks for a benchmark portfolio set, so authoring more fixtures is part of this. I have not started on any of it; flagging it here so the scope is visible before I pick an approach.
+Three things the issue body does not mention, which I think shape the work. `rag/evaluator/` holds only `relevance_scorer.py` and `faithfulness_checker.py`, so an actionability score needs a new scorer. `ReviewGenerator.__init__` constructs its own `openai.OpenAI` client and never dispatches on `settings.llm_provider`, so the mock path needs an injection seam. And `basic_profile.json` is one profile where the issue asks for a benchmark set, so I will need to write more fixtures. I have not started on any of it, and I am flagging it so the scope is visible first.
 `````
 
 ## Eval iterations
